@@ -1,5 +1,5 @@
 /*
-Copyright 2018-2019 Gravitational, Inc.
+Copyright 2018-2020 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -395,7 +395,11 @@ func (f *Forwarder) setupContext(ctx auth.Context, req *http.Request, isRemoteUs
 		// DELETE IN(4.3.0)
 		// This logic is deprecated and after the second upgrade, will not be used
 		// by the newer post 4.2.0 clients, so will be safe to remove
-		for _, remoteCluster := range f.Tunnel.GetSites() {
+		clusters, err := f.Tunnel.GetSites()
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		for _, remoteCluster := range clusters {
 			encodedName := kubeutils.EncodeClusterName(remoteCluster.GetName())
 			if strings.HasPrefix(req.Host, remoteCluster.GetName()+".") || strings.HasPrefix(req.Host, encodedName+".") {
 				f.Debugf("Going to proxy to cluster: %v based on matching host prefix %v.", remoteCluster.GetName(), req.Host)

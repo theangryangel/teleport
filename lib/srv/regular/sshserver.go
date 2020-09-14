@@ -595,6 +595,10 @@ func (s *Server) getNamespace() string {
 	return services.ProcessNamespace(s.namespace)
 }
 
+func (s *Server) tunnelWithRoles(ctx *srv.ServerContext) reversetunnel.Server {
+	return reversetunnel.NewServerWithRoles(s.proxyTun, ctx.Identity.RoleSet, s.authService)
+}
+
 // Context returns server shutdown context
 func (s *Server) Context() context.Context {
 	return s.ctx
