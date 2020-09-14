@@ -100,11 +100,9 @@ type RemoteSite interface {
 // sites connect and register with it.
 type Server interface {
 	// GetSites returns a list of connected remote sites
-	GetSites() []RemoteSite
+	GetSites() ([]RemoteSite, error)
 	// GetSite returns remote site this node belongs to
 	GetSite(domainName string) (RemoteSite, error)
-	// RemoveSite removes the site with the specified name from the list of connected sites
-	RemoveSite(domainName string) error
 	// Start starts server
 	Start() error
 	// Close closes server's operations immediately
