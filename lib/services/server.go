@@ -416,6 +416,39 @@ const ServerSpecV2Schema = `{
         }
       }
     },
+    "kubernetes_clusters": {
+      "type": "array",
+      "items": {
+        "type": "object",
+         "required": ["name"],
+         "properties": {
+           "name": {"type": "string"},
+           "static_labels": {
+             "type": "object",
+             "additionalProperties": false,
+             "patternProperties": {
+               "^.*$":  { "type": "string" }
+             }
+           },
+           "dynamic_labels": {
+             "type": "object",
+             "additionalProperties": false,
+             "patternProperties": {
+               "^.*$": {
+                 "type": "object",
+                 "additionalProperties": false,
+                 "required": ["command"],
+                 "properties": {
+                   "command": {"type": "array", "items": {"type": "string"}},
+                   "period": {"type": "string"},
+                   "result": {"type": "string"}
+                 }
+               }
+             }
+           }
+         }
+       }
+    },
     "rotation": %v
   }
 }`

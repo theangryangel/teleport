@@ -85,14 +85,20 @@ type ForwarderConfig struct {
 	Context context.Context
 	// KubeconfigPath is a path to kubernetes configuration
 	KubeconfigPath string
+	// NewKubeService specifies whether to apply the additional kubernetes_service features:
+	// - parsing multiple kubeconfig entries
+	// - enforcing self permission check
+	NewKubeService bool
+	// KubeClusterName is the name of the kubernetes cluster that this
+	// forwarder handles.
+	KubeClusterName string
 	// Clock is a server clock, could be overridden in tests
 	Clock clockwork.Clock
 	// PingPeriod is a period for sending ping messages on the incoming
 	// connection.
 	PingPeriod time.Duration
-	// StrictImpersonationCheck specifies whether to fail when impersonation
-	// permissions of this forwarder can't be tested.
-	StrictImpersonationCheck bool
+	// Component name to include in log output.
+	Component string
 }
 
 // CheckAndSetDefaults checks and sets default values
@@ -130,6 +136,15 @@ func (f *ForwarderConfig) CheckAndSetDefaults() error {
 	if f.PingPeriod == 0 {
 		f.PingPeriod = defaults.HighResPollingPeriod
 	}
+	if f.Component == "" {
+		f.Component = "kube_forwarder"
+	}
+	if f.KubeClusterName == "" && f.KubeconfigPath == "" {
+		// Running without a kubeconfig and explicit k8s cluster name. Use
+		// teleport cluster name instead, to ask kubeutils.GetKubeConfig to
+		// attempt loading the in-cluster credentials.
+		f.KubeClusterName = f.ClusterName
+	}
 	return nil
 }
 
@@ -140,10 +155,10 @@ func NewForwarder(cfg ForwarderConfig) (*Forwarder, error) {
 		return nil, trace.Wrap(err)
 	}
 	log := log.WithFields(log.Fields{
-		trace.Component: teleport.Component(teleport.ComponentProxyKube),
+		trace.Component: cfg.Component,
 	})
 
-	creds, err := getKubeCreds(cfg.Context, log, cfg.KubeconfigPath, cfg.StrictImpersonationCheck)
+	creds, err := getKubeCreds(cfg.Context, log, cfg.ClusterName, cfg.KubeClusterName, cfg.KubeconfigPath, cfg.NewKubeService)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -200,11 +215,11 @@ type Forwarder struct {
 	close context.CancelFunc
 	// ctx is a global context signalling exit
 	ctx context.Context
-	// creds contain kubernetes credentials shared with a proxy process,
-	// could be a service account token or client X509 credentials.
+	// creds contain kubernetes credentials for multiple clusters.
+	// map key is cluster name.
 	//
 	// Note: creds can be nil.
-	creds *kubeCreds
+	creds map[string]*kubeCreds
 }
 
 // Close signals close to all outstanding or background operations
@@ -220,6 +235,7 @@ type authContext struct {
 	auth.Context
 	kubeGroups    map[string]struct{}
 	kubeUsers     map[string]struct{}
+	kubeCluster   string
 	tpCluster     tpClusterClient
 	clusterConfig services.ClusterConfig
 	// clientIdleTimeout sets information on client idle timeout
@@ -232,7 +248,7 @@ type authContext struct {
 }
 
 func (c authContext) String() string {
-	return fmt.Sprintf("user: %v, users: %v, groups: %v, cluster: %v", c.User.GetName(), c.kubeUsers, c.kubeGroups, c.tpCluster.name)
+	return fmt.Sprintf("user: %v, users: %v, groups: %v, teleport cluster: %v, kube cluster: %v", c.User.GetName(), c.kubeUsers, c.kubeGroups, c.tpCluster.name, c.kubeCluster)
 }
 
 func (c *authContext) key() string {
@@ -416,12 +432,17 @@ func (f *Forwarder) setupContext(ctx auth.Context, req *http.Request, isRemoteUs
 		isRemoteClosed = func() bool { return false }
 	}
 
+	kubeCluster := identity.KubernetesCluster
+	if kubeCluster == "" {
+		kubeCluster = tpClusterName
+	}
 	authCtx := &authContext{
 		clientIdleTimeout: roles.AdjustClientIdleTimeout(clusterConfig.GetClientIdleTimeout()),
 		sessionTTL:        sessionTTL,
 		Context:           ctx,
 		kubeGroups:        utils.StringsSet(kubeGroups),
 		kubeUsers:         utils.StringsSet(kubeUsers),
+		kubeCluster:       kubeCluster,
 		clusterConfig:     clusterConfig,
 		tpCluster: tpClusterClient{
 			name:           tpClusterName,
@@ -612,6 +633,7 @@ func (f *Forwarder) exec(ctx *authContext, w http.ResponseWriter, req *http.Requ
 
 	executor, err := f.getExecutor(*ctx, sess, req)
 	if err != nil {
+		f.WithError(err).Warning("Failed creating executor.")
 		return nil, trace.Wrap(err)
 	}
 	streamOptions := proxy.options()
@@ -622,9 +644,12 @@ func (f *Forwarder) exec(ctx *authContext, w http.ResponseWriter, req *http.Requ
 		streamOptions.Stderr = utils.NewBroadcastWriter(streamOptions.Stderr, recorder)
 	}
 
-	err = executor.Stream(streamOptions)
+	if err = executor.Stream(streamOptions); err != nil {
+		f.WithError(err).Warning("Executor failed while streaming.")
+		return nil, trace.Wrap(err)
+	}
 	if err := proxy.sendStatus(err); err != nil {
-		f.Warningf("Failed to send status: %v. Exec command was aborted by client.", err)
+		f.WithError(err).Warning("Failed to send status. Exec command was aborted by client.")
 		return nil, trace.Wrap(err)
 	}
 
@@ -953,9 +978,13 @@ func (f *Forwarder) getExecutor(ctx authContext, sess *clusterSession, req *http
 		followRedirects: true,
 		pingPeriod:      f.PingPeriod,
 	})
-	rt, err := f.creds.wrapTransport(upgradeRoundTripper)
-	if err != nil {
-		return nil, trace.Wrap(err)
+	rt := http.RoundTripper(upgradeRoundTripper)
+	if sess.creds != nil {
+		var err error
+		rt, err = sess.creds.wrapTransport(rt)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
 	}
 	return remotecommand.NewSPDYExecutorForTransports(rt, upgradeRoundTripper, req.Method, req.URL)
 }
@@ -969,9 +998,13 @@ func (f *Forwarder) getDialer(ctx authContext, sess *clusterSession, req *http.R
 		followRedirects: true,
 		pingPeriod:      f.PingPeriod,
 	})
-	rt, err := f.creds.wrapTransport(upgradeRoundTripper)
-	if err != nil {
-		return nil, trace.Wrap(err)
+	rt := http.RoundTripper(upgradeRoundTripper)
+	if sess.creds != nil {
+		var err error
+		rt, err = sess.creds.wrapTransport(rt)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
 	}
 	client := &http.Client{
 		Transport: rt,
@@ -985,6 +1018,7 @@ func (f *Forwarder) getDialer(ctx authContext, sess *clusterSession, req *http.R
 type clusterSession struct {
 	authContext
 	parent    *Forwarder
+	creds     *kubeCreds
 	tlsConfig *tls.Config
 	forwarder *forward.Forwarder
 	startTime time.Time
@@ -1118,6 +1152,7 @@ func (f *Forwarder) serializedNewClusterSession(authContext authContext) (*clust
 
 func (f *Forwarder) newClusterSession(ctx authContext) (*clusterSession, error) {
 	var tlsConfig *tls.Config
+	var creds *kubeCreds
 
 	// For remote (trusted) clusters, generate a new teleport TLS client
 	// certificate for the user via auth server. Effectively, impersonate the
@@ -1129,19 +1164,20 @@ func (f *Forwarder) newClusterSession(ctx authContext) (*clusterSession, error) 
 			f.Warningf("Failed to get certificate for %v: %v.", ctx, err)
 			return nil, trace.AccessDenied("access denied: failed to authenticate with auth server")
 		}
+		// remote clusters use special hardcoded URL,
+		// and use a special dialer
+		ctx.tpCluster.targetAddr = reversetunnel.LocalKubernetes
 	} else {
 		if f.creds == nil {
 			return nil, trace.NotFound("this Teleport proxy is not configured for direct Kubernetes access; you likely need to 'tsh login' into a leaf cluster")
 		}
-		tlsConfig = f.creds.tlsConfig
-	}
-
-	// remote clusters use special hardcoded URL,
-	// and use a special dialer
-	if ctx.tpCluster.isRemote {
-		ctx.tpCluster.targetAddr = reversetunnel.LocalKubernetes
-	} else {
-		ctx.tpCluster.targetAddr = f.creds.targetAddr
+		var ok bool
+		creds, ok = f.creds[ctx.kubeCluster]
+		if !ok {
+			return nil, trace.BadParameter("kubernetes cluster %q not found", ctx.kubeCluster)
+		}
+		tlsConfig = creds.tlsConfig
+		ctx.tpCluster.targetAddr = creds.targetAddr
 	}
 
 	sess := &clusterSession{
@@ -1149,6 +1185,7 @@ func (f *Forwarder) newClusterSession(ctx authContext) (*clusterSession, error) 
 		authContext: ctx,
 		tlsConfig:   tlsConfig,
 		startTime:   time.Now().UTC(),
+		creds:       creds,
 	}
 
 	var transport http.RoundTripper = f.newTransport(sess.Dial, tlsConfig)
@@ -1159,9 +1196,9 @@ func (f *Forwarder) newClusterSession(ctx authContext) (*clusterSession, error) 
 	//
 	// When forwarding request to a remote cluster, this is not needed
 	// as the proxy uses client cert auth to reach out to remote proxy.
-	if !ctx.tpCluster.isRemote {
+	if creds != nil {
 		var err error
-		transport, err = f.creds.wrapTransport(transport)
+		transport, err = creds.wrapTransport(transport)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -1292,6 +1329,17 @@ func (f *Forwarder) requestCertificate(ctx authContext) (*tls.Config, error) {
 	tlsConfig.BuildNameToCertificate()
 
 	return tlsConfig, nil
+}
+
+func (f *Forwarder) kubeClusters() []*services.KubernetesCluster {
+	res := make([]*services.KubernetesCluster, 0, len(f.creds))
+	for n := range f.creds {
+		res = append(res, &services.KubernetesCluster{
+			Name: n,
+			// TODO: labels
+		})
+	}
+	return res
 }
 
 type responseStatusRecorder struct {

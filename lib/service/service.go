@@ -2448,11 +2448,11 @@ func (process *TeleportProcess) initProxyEndpoint(conn *Connector) error {
 				ServerID:        cfg.HostUUID,
 				ClusterOverride: cfg.Proxy.Kube.ClusterOverride,
 				KubeconfigPath:  cfg.Proxy.Kube.KubeconfigPath,
+				Component:       teleport.Component(teleport.ComponentProxy, teleport.ComponentProxyKube),
 			},
 			TLS:           tlsConfig,
 			LimiterConfig: cfg.Proxy.Limiter,
 			AccessPoint:   accessPoint,
-			Component:     teleport.Component(teleport.ComponentProxy, teleport.ComponentProxyKube),
 		})
 		if err != nil {
 			return trace.Wrap(err)
